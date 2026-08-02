@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+from telethon.sessions import MemorySession, StringSession
 from telethon.errors import (
     ChannelPrivateError,
     ChatAdminRequiredError,
@@ -33,26 +33,7 @@ from telethon.tl.types import (
 # CONFIGURATION
 # =========================================================
 
-# Railway stores these values in the service's Variables section.
-# The bot will stop with a clear error if any required value is missing.
-REQUIRED_ENV_VARS = (
-    "BOT_TOKEN",
-    "API_ID",
-    "API_HASH",
-    "STRING_SESSION",
-)
-
-missing_env_vars = [
-    name for name in REQUIRED_ENV_VARS
-    if not os.getenv(name)
-]
-
-if missing_env_vars:
-    raise RuntimeError(
-        "Missing environment variable(s): "
-        + ", ".join(missing_env_vars)
-    )
-
+# Add these four values in Railway under the worker service's Variables tab.
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -70,18 +51,16 @@ PROGRESS_UPDATE_INTERVAL = 1
 # TELETHON CLIENTS
 # =========================================================
 
-# Personal Telegram account used to inspect public groups.
-# The authorization is loaded from Railway's STRING_SESSION variable.
+# Personal Telegram account used to inspect groups.
 user_client = TelegramClient(
     StringSession(STRING_SESSION),
     API_ID,
     API_HASH,
 )
 
-# Bot account used to receive requests and send results.
-# An in-memory session avoids creating a bot session file on Railway.
+# In-memory session is enough for the BotFather bot on Railway.
 bot_client = TelegramClient(
-    StringSession(),
+    MemorySession(),
     API_ID,
     API_HASH,
 )
@@ -416,6 +395,364 @@ async def get_priority_admins(group_link: str) -> dict:
         )
 
         is_admin = isinstance(
+            participant,
+            ChannelParticipantAdmin,
+        )
+
+        if not is_owner and not is_admin:
+            continue
+
+        # Remove Telegram bot accounts.
+        if getattr(user, "bot", False):
+            continue
+
+        username = getattr(user, "username", None)
+
+        # Skip accounts without public usernames.
+        if not username:
+            continue
+
+        activity = describe_activity(
+            getattr(user, "status", None)
+        )
+
+        custom_title = getattr(
+            participant,
+            "rank",
+            None,
+        )
+
+        admin_data = {
+            "username": f"@{username}",
+            "role": "Owner" if is_owner else "Admin",
+            "custom_title": custom_title,
+            "activity": activity["text"],
+            "activity_rank": activity["rank"],
+            "activity_timestamp": activity["timestamp"],
+        }
+
+        if is_owner:
+            owner = admin_data
+        else:
+            regular_admins.append(admin_data)
+
+    regular_admins.sort(
+        key=admin_sort_key,
+        reverse=True,
+    )
+
+    return {
+        "owner": owner,
+        "active_admins": regular_admins[:MAX_ACTIVE_ADMINS],
+    }
+
+
+def format_person(person: dict) -> str:
+    """Format an owner or administrator for the output."""
+
+    custom_title = person.get("custom_title")
+
+    if custom_title:
+        return (
+            f"{person['username']} "
+            f"({person['role']}, {custom_title}, "
+            f"{person['activity']})"
+        )
+
+    return (
+        f"{person['username']} "
+        f"({person['role']}, {person['activity']})"
+    )
+
+
+# =========================================================
+# MESSAGE HELPERS
+# =========================================================
+
+async def safe_reply(event, text: str):
+    """Reply without allowing a temporary Telegram error to stop the bot."""
+
+    try:
+        return await event.reply(
+            text,
+            link_preview=False,
+        )
+
+    except FloodWaitError as error:
+        await asyncio.sleep(error.seconds + 1)
+
+        return await event.reply(
+            text,
+            link_preview=False,
+        )
+
+    except RPCError as error:
+        print(f"Reply error: {error}")
+        return None
+
+
+async def safe_edit(message, text: str):
+    """Edit the live progress message safely."""
+
+    if message is None:
+        return
+
+    try:
+        await message.edit(
+            text,
+            link_preview=False,
+        )
+
+    except FloodWaitError as error:
+        await asyncio.sleep(error.seconds + 1)
+
+        try:
+            await message.edit(
+                text,
+                link_preview=False,
+            )
+
+        except RPCError as retry_error:
+            print(f"Progress edit retry failed: {retry_error}")
+
+    except RPCError as error:
+        if "message not modified" not in str(error).lower():
+            print(f"Progress edit error: {error}")
+
+
+def split_long_output(
+    blocks: list[str],
+    maximum: int = MESSAGE_CHUNK_SIZE,
+) -> list[str]:
+    """Split output without cutting through normal project blocks."""
+
+    chunks: list[str] = []
+    current_chunk = ""
+
+    for block in blocks:
+        proposed = (
+            block
+            if not current_chunk
+            else f"{current_chunk}\n\n{block}"
+        )
+
+        if len(proposed) <= maximum:
+            current_chunk = proposed
+            continue
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        if len(block) <= maximum:
+            current_chunk = block
+        else:
+            for start in range(0, len(block), maximum):
+                chunks.append(
+                    block[start:start + maximum]
+                )
+
+            current_chunk = ""
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+async def send_output_chunks(event, blocks: list[str]):
+    """Send long results across multiple Telegram messages."""
+
+    chunks = split_long_output(blocks)
+
+    for index, chunk in enumerate(chunks, start=1):
+        heading = ""
+
+        if len(chunks) > 1:
+            heading = f"Results {index}/{len(chunks)}\n\n"
+
+        await safe_reply(
+            event,
+            heading + chunk,
+        )
+
+        await asyncio.sleep(0.5)
+
+
+# =========================================================
+# PROGRESS DISPLAY
+# =========================================================
+
+def build_progress_text(
+    total: int,
+    completed: int,
+    successful: int,
+    failed: int,
+    private_links: int,
+    missing_links: int,
+    duplicates: int,
+    current: str,
+) -> str:
+    """Build the live progress message."""
+
+    percentage = (
+        int((completed / total) * 100)
+        if total
+        else 0
+    )
+
+    return (
+        "⏳ Processing project list\n\n"
+        f"Progress: {completed}/{total} ({percentage}%)\n"
+        f"Successful: {successful}\n"
+        f"Failed or unavailable: {failed}\n"
+        f"Private links: {private_links}\n"
+        f"Missing TG links: {missing_links}\n"
+        f"Duplicates skipped: {duplicates}\n\n"
+        f"Current: {current}"
+    )
+
+
+# =========================================================
+# PROJECT PROCESSING
+# =========================================================
+
+async def process_project_list(event, text: str):
+    """Process a full project submission and return two result lists."""
+
+    chat_id = event.chat_id
+
+    if chat_id in active_jobs:
+        await safe_reply(
+            event,
+            "⚠️ A list is already being processed in this chat. "
+            "Wait for it to finish before submitting another.",
+        )
+        return
+
+    active_jobs.add(chat_id)
+
+    try:
+        projects = mark_duplicates(pair_project_links(text))
+
+        if not projects:
+            await safe_reply(event, "❌ I could not find any valid X project links.")
+            return
+
+        total = len(projects)
+        successful = 0
+        failed = 0
+        private_links = 0
+        missing_links = 0
+        duplicate_count = 0
+
+        accessible_blocks: list[str] = []
+        inaccessible_blocks: list[str] = []
+
+        progress_message = await safe_reply(
+            event,
+            build_progress_text(
+                total=total,
+                completed=0,
+                successful=0,
+                failed=0,
+                private_links=0,
+                missing_links=0,
+                duplicates=0,
+                current="Preparing batch...",
+            ),
+        )
+
+        for position, project in enumerate(projects, start=1):
+            x_link = project["x_link"]
+            tg_link = project.get("tg_link")
+            current_status = "Checking..."
+
+            if project["is_duplicate"]:
+                duplicate_count += 1
+                current_status = "Duplicate skipped"
+                inaccessible_blocks.append(
+                    f"{position}.\n"
+                    f"X link: {x_link}\n"
+                    f"TG link: {tg_link or 'Not provided'}\n"
+                    f"Status: ⚠️ Duplicate skipped\n"
+                    f"Reason: {project['duplicate_reason']}"
+                )
+
+            elif not tg_link:
+                missing_links += 1
+                current_status = "Missing Telegram link"
+                inaccessible_blocks.append(
+                    f"{position}.\n"
+                    f"X link: {x_link}\n"
+                    f"TG link: Not provided\n"
+                    f"Status: ⚠️ Missing Telegram link"
+                )
+
+            elif is_private_invite_link(tg_link):
+                private_links += 1
+                current_status = "Private invite link"
+                inaccessible_blocks.append(
+                    f"{position}.\n"
+                    f"X link: {x_link}\n"
+                    f"TG link: {tg_link}\n"
+                    f"Status: 🔒 Private invite link"
+                )
+
+            else:
+                tg_username = extract_public_tg_username(tg_link)
+
+                if not tg_username:
+                    failed += 1
+                    current_status = "Invalid Telegram link"
+                    inaccessible_blocks.append(
+                        f"{position}.\n"
+                        f"X link: {x_link}\n"
+                        f"TG link: {tg_link}\n"
+                        f"Status: ❌ Invalid Telegram group link"
+                    )
+                else:
+                    try:
+                        result = await get_priority_admins(tg_link)
+                        owner = result["owner"]
+                        active_admins = result["active_admins"]
+
+                        if owner or active_admins:
+                            successful += 1
+                            current_status = "Success"
+                            owner_text = (
+                                format_person(owner)
+                                if owner
+                                else "Owner not publicly visible or has no username"
+                            )
+                            active_admin_text = (
+                                "\n".join(format_person(admin) for admin in active_admins)
+                                if active_admins
+                                else "No human administrators with public usernames found"
+                            )
+                            accessible_blocks.append(
+                                f"{position}.\n"
+                                f"X link: {x_link}\n"
+                                f"TG link: {tg_link}\n"
+                                f"Status: ✅ Success\n"
+                                f"Owner:\n{owner_text}\n"
+                                f"Top active admins:\n{active_admin_text}"
+                            )
+                        else:
+                            failed += 1
+                            current_status = "No public human admins"
+                            inaccessible_blocks.append(
+                                f"{position}.\n"
+                                f"X link: {x_link}\n"
+                                f"TG link: {tg_link}\n"
+                                f"Status: ⚠️ No public human admins"
+                            )
+
+                    except FloodWaitError as error:
+                        current_status = f"Waiting {error.seconds} seconds"
+                        await safe_edit(
+                            progress_message,
+                            build_progress_text(
+                              = isinstance(
             participant,
             ChannelParticipantAdmin,
         )
