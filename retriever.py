@@ -1142,7 +1142,7 @@ async def process_project_list(event, text: str):
                                 f"Top active admins: None available"
                             )
 
-                    except FloodWaitError as error:
+                                        except FloodWaitError as error:
                         current_status = (
                             f"Waiting {error.seconds} seconds"
                         )
@@ -1169,43 +1169,61 @@ async def process_project_list(event, text: str):
                             )
 
                             owner = result["owner"]
-                            active_admins = result[
-                                "active_admins"
-                            ]
+                            active_admins = result["active_admins"]
 
-                            successful += 1
-                            current_status = "Success after waiting"
+                            if owner or active_admins:
+                                successful += 1
+                                current_status = "Success after waiting"
 
-                            owner_text = (
-                                format_person(owner)
-                                if owner
-                                else "Owner not publicly visible"
-                            )
-
-                            active_admin_text = (
-                                "\n".join(
-                                    format_person(admin)
-                                    for admin in active_admins
+                                owner_text = (
+                                    format_person(owner)
+                                    if owner
+                                    else (
+                                        "Owner not publicly visible "
+                                        "or has no username"
+                                    )
                                 )
-                                if active_admins
-                                else "No public human admins"
-                            )
 
-                            output_blocks.append(
-                                f"{position}.\n"
-                                f"X link: {x_link}\n"
-                                f"TG link: {tg_link}\n"
-                                f"Status: ✅ Success\n"
-                                f"Owner:\n{owner_text}\n"
-                                f"Top active admins:\n"
-                                f"{active_admin_text}"
-                            )
+                                active_admin_text = (
+                                    "\n".join(
+                                        format_person(admin)
+                                        for admin in active_admins
+                                    )
+                                    if active_admins
+                                    else (
+                                        "No human administrators with "
+                                        "public usernames found"
+                                    )
+                                )
+
+                                accessible_blocks.append(
+                                    f"{position}.\n"
+                                    f"X link: {x_link}\n"
+                                    f"TG link: {tg_link}\n"
+                                    f"Status: ✅ Success\n"
+                                    f"Owner:\n{owner_text}\n"
+                                    f"Top active admins:\n"
+                                    f"{active_admin_text}"
+                                )
+
+                            else:
+                                failed += 1
+                                current_status = (
+                                    "No public human admins"
+                                )
+
+                                inaccessible_blocks.append(
+                                    f"{position}.\n"
+                                    f"X link: {x_link}\n"
+                                    f"TG link: {tg_link}\n"
+                                    f"Status: ⚠️ No public human admins"
+                                )
 
                         except Exception as retry_error:
                             failed += 1
                             current_status = "Failed after waiting"
 
-                            output_blocks.append(
+                            inaccessible_blocks.append(
                                 f"{position}.\n"
                                 f"X link: {x_link}\n"
                                 f"TG link: {tg_link}\n"
@@ -1220,7 +1238,7 @@ async def process_project_list(event, text: str):
                         failed += 1
                         current_status = "Group inaccessible"
 
-                        output_blocks.append(
+                        inaccessible_blocks.append(
                             f"{position}.\n"
                             f"X link: {x_link}\n"
                             f"TG link: {tg_link}\n"
@@ -1237,7 +1255,7 @@ async def process_project_list(event, text: str):
                         failed += 1
                         current_status = "Group not found"
 
-                        output_blocks.append(
+                        inaccessible_blocks.append(
                             f"{position}.\n"
                             f"X link: {x_link}\n"
                             f"TG link: {tg_link}\n"
@@ -1251,7 +1269,7 @@ async def process_project_list(event, text: str):
                         private_links += 1
                         current_status = "Invalid private invitation"
 
-                        output_blocks.append(
+                        inaccessible_blocks.append(
                             f"{position}.\n"
                             f"X link: {x_link}\n"
                             f"TG link: {tg_link}\n"
@@ -1263,7 +1281,7 @@ async def process_project_list(event, text: str):
                         failed += 1
                         current_status = "Telegram error"
 
-                        output_blocks.append(
+                        inaccessible_blocks.append(
                             f"{position}.\n"
                             f"X link: {x_link}\n"
                             f"TG link: {tg_link}\n"
@@ -1275,7 +1293,7 @@ async def process_project_list(event, text: str):
                         failed += 1
                         current_status = "Unexpected failure"
 
-                        output_blocks.append(
+                        inaccessible_blocks.append(
                             f"{position}.\n"
                             f"X link: {x_link}\n"
                             f"TG link: {tg_link}\n"
@@ -1312,27 +1330,15 @@ async def process_project_list(event, text: str):
         final_summary = (
             "✅ Batch completed\n\n"
             f"Projects submitted: {total}\n"
-            f"Successful: {successful}\n"
-            f"Failed or unavailable: {failed}\n"
+            f"Accessible: {len(accessible_blocks)}\n"
+            f"Inaccessible or unavailable: "
+            f"{len(inaccessible_blocks)}\n"
             f"Private links: {private_links}\n"
             f"Missing TG links: {missing_links}\n"
             f"Duplicates skipped: {duplicate_count}"
         )
 
-        await safe_edit(
-            progress_message,
-            final_summary,
-        )
-
-        await send_output_chunks(
-            event,
-            output_blocks,
-        )
-
-    finally:
-        active_jobs.discard(chat_id)
-
-
+        await safe
 # =========================================================
 # BOT COMMANDS
 # =========================================================
