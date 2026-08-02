@@ -1,32 +1,50 @@
-# Project Admin Retriever
+PROJECT HUNTER BOT
 
-A Telegram bot that accepts X/Twitter project links paired with Telegram group links and reports the group owner plus recently active human administrators.
+FILES
+project_hunter.py
+requirements.txt
+Procfile
+.gitignore
 
-## Setup
+RAILWAY VARIABLES
+BOT_TOKEN=your BotFather token
+API_ID=your Telegram API ID
+API_HASH=your Telegram API hash
+STRING_SESSION=your Telethon StringSession
+COINGECKO_API_KEY=your CoinGecko demo API key
+X_BEARER_TOKEN=your official X API bearer token
+DATABASE_PATH=/data/project_hunter.db
+ALLOWED_CHAT_ID=your Telegram numeric chat ID
 
-1. Create and activate a virtual environment.
-2. Install dependencies:
+OPTIONAL VARIABLES
+MIN_MARKET_CAP=10000
+MAX_MARKET_CAP=1000000000
+MAX_PAGES_PER_SCAN=10
+PAGE_SIZE=250
+MAX_X_INACTIVE_DAYS=30
+MAX_TG_INACTIVE_DAYS=30
+TG_ACTIVITY_LOOKBACK_DAYS=7
+TG_MIN_MESSAGES_7D=5
+TG_MIN_HUMAN_SENDERS_7D=2
 
-   ```powershell
-   python -m pip install -r requirements.txt
-   ```
+RAILWAY VOLUME
+Mount a persistent volume at:
+/data
 
-3. Copy `.env.example` to `.env`, then replace every placeholder with your own Telegram credentials. Obtain `API_ID` and `API_HASH` from [my.telegram.org](https://my.telegram.org/apps), and create the bot token through [@BotFather](https://t.me/BotFather).
-4. Load the environment variables before starting the app. In PowerShell:
+START COMMAND
+python project_hunter.py
 
-   ```powershell
-   $env:API_ID = "12345678"
-   $env:API_HASH = "your_api_hash"
-   $env:BOT_TOKEN = "your_bot_token"
-   python Retriever.py
-   ```
+COMMANDS
+/start
+/scan
+/scan 20
+/scan 20 artificial-intelligence
+/qualified
+/rejected
+/latest
+/count
 
-The first run authenticates your personal Telegram account and creates a local session file. Keep that file private; it is ignored by Git.
-
-## GitHub upload checklist
-
-- Regenerate the bot token and API hash that were previously embedded in the script.
-- Confirm `.env` and all `*.session` files are not staged.
-- Create a repository on GitHub, then commit and push this folder using GitHub Desktop or Git after it is installed.
-
-This repository intentionally contains only source code and configuration templates, never live credentials or Telegram session data.
+IMPORTANT
+The X activity filter uses the official X API and therefore requires
+X_BEARER_TOKEN. Without it, projects will be rejected because X activity
+cannot be verified.
