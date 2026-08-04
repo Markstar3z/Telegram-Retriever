@@ -56,6 +56,10 @@ user_client = TelegramClient(
     StringSession(STRING_SESSION),
     API_ID,
     API_HASH,
+    auto_reconnect=True,
+    connection_retries=10,
+    retry_delay=3,
+    request_retries=5,
 )
 
 # In-memory session is enough for the BotFather bot on Railway.
@@ -63,10 +67,17 @@ bot_client = TelegramClient(
     MemorySession(),
     API_ID,
     API_HASH,
+    auto_reconnect=True,
+    connection_retries=10,
+    retry_delay=3,
+    request_retries=5,
 )
 
 # Prevent multiple batches from running in the same Telegram chat.
 active_jobs: set[int] = set()
+
+# Prevent two coroutines from reconnecting the user session at once.
+user_connection_lock = asyncio.Lock()
 
 
 # =========================================================
@@ -367,6 +378,49 @@ def admin_sort_key(admin: dict) -> tuple:
     )
 
 
+async def ensure_user_client_connected() -> None:
+    """Reconnect and verify the personal Telegram account session."""
+
+    async with user_connection_lock:
+        for attempt in range(1, 4):
+            try:
+                if not user_client.is_connected():
+                    print(
+                        "Personal Telegram client disconnected. "
+                        f"Reconnect attempt {attempt}/3..."
+                    )
+                    await user_client.connect()
+
+                if not await user_client.is_user_authorized():
+                    raise RuntimeError(
+                        "STRING_SESSION is invalid or no longer authorized."
+                    )
+
+                # Confirms the connection can actually send API requests.
+                await user_client.get_me()
+                return
+
+            except Exception as error:
+                print(
+                    f"Personal Telegram reconnect attempt "
+                    f"{attempt}/3 failed: {error}"
+                )
+
+                try:
+                    if user_client.is_connected():
+                        await user_client.disconnect()
+                except Exception:
+                    pass
+
+                if attempt < 3:
+                    await asyncio.sleep(attempt * 2)
+
+        raise RuntimeError(
+            "Personal Telegram account could not reconnect "
+            "after three attempts."
+        )
+
+
 # =========================================================
 # ADMIN RETRIEVAL
 # =========================================================
@@ -377,6 +431,8 @@ async def get_priority_admins(group_link: str) -> dict:
 
     Telegram bot accounts and accounts without usernames are excluded.
     """
+
+    await ensure_user_client_connected()
 
     entity = await user_client.get_entity(group_link)
 
@@ -1003,6 +1059,20 @@ async def project_list_handler(event):
 # STARTUP AND CLEAN SHUTDOWN
 # =========================================================
 
+async def user_client_keepalive() -> None:
+    """Check and restore the personal Telegram connection periodically."""
+
+    while True:
+        try:
+            await ensure_user_client_connected()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"Personal Telegram keepalive failed: {error}")
+
+        await asyncio.sleep(30)
+
+
 async def disconnect_clients():
     """Disconnect both Telethon clients safely."""
 
@@ -1023,25 +1093,13 @@ async def disconnect_clients():
 
 
 async def main():
-    """Start the personal account and Telegram bot."""
+    """Start the Telegram bot and personal account connection."""
+
+    keepalive_task = None
 
     try:
-        print("Starting personal Telethon session...")
-
-        await user_client.start()
-
-        personal_account = await user_client.get_me()
-
-        personal_name = (
-            f"@{personal_account.username}"
-            if personal_account.username
-            else personal_account.first_name
-        )
-
-        print(
-            f"Personal account connected: {personal_name}"
-        )
-
+        # Start the bot first so /start still works even if the personal
+        # Telegram session temporarily fails to connect.
         print("Starting Telegram bot...")
 
         await bot_client.start(
@@ -1054,23 +1112,57 @@ async def main():
             f"Bot connected: @{bot_account.username}"
         )
 
+        try:
+            print("Connecting personal Telethon session...")
+
+            await ensure_user_client_connected()
+
+            personal_account = await user_client.get_me()
+
+            personal_name = (
+                f"@{personal_account.username}"
+                if personal_account.username
+                else personal_account.first_name
+            )
+
+            print(
+                f"Personal account connected: {personal_name}"
+            )
+
+        except Exception as error:
+            print(
+                "Personal Telegram session is temporarily unavailable:",
+                error,
+            )
+            print(
+                "The bot will remain online and retry automatically."
+            )
+
+        keepalive_task = asyncio.create_task(
+            user_client_keepalive()
+        )
+
         print("=" * 60)
         print("PROJECT ADMIN RETRIEVER IS RUNNING")
         print("Send project lists to the Telegram bot.")
-        print("Press Ctrl+C to stop.")
         print("=" * 60)
 
         await bot_client.run_until_disconnected()
 
-    except asyncio.CancelledError:
-        print("\nShutdown requested.")
-
     finally:
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+
+            await asyncio.gather(
+                keepalive_task,
+                return_exceptions=True,
+            )
+
         await disconnect_clients()
 
 
 def run():
-    """Run the program and handle Ctrl+C."""
+    """Run the program and report startup failures."""
 
     try:
         asyncio.run(main())
@@ -1079,7 +1171,10 @@ def run():
         print("\nBot stopped by the user.")
 
     except Exception as error:
-        print(f"\nThe bot stopped because of an error: {error}")
+        print(
+            f"\nThe bot stopped because of an error: {error}"
+        )
+        raise
 
     finally:
         print("Program closed.")
