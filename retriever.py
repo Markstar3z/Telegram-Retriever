@@ -62,46 +62,121 @@ user_connection_lock = asyncio.Lock()
 
 
 def clean_url(url: str) -> str:
-    return url.strip().rstrip(".,;:!?)]}>\"'")
+    """Remove labels and punctuation accidentally attached to a URL."""
+
+    value = url.strip()
+    value = re.sub(r"^(?:X|TWITTER|TG|TELEGRAM)\s*:\s*", "", value, flags=re.I)
+    return value.rstrip(".,;:!?)]}>\"'")
 
 
 def normalize_url(url: str) -> str:
+    """Normalize X and Telegram links, including links without a scheme."""
+
     url = clean_url(url)
+
+    if not re.match(r"^https?://", url, flags=re.I):
+        url = "https://" + url.lstrip("/")
+
     url = re.sub(r"^http://", "https://", url, flags=re.I)
     url = re.sub(r"^https://www\.", "https://", url, flags=re.I)
+
     return url.rstrip("/")
 
 
+def extract_links_from_line(line: str) -> list[str]:
+    """Extract X, Twitter and Telegram links from any part of a line."""
+
+    pattern = re.compile(
+        r"(?:https?://)?(?:www\.)?"
+        r"(?:x\.com|twitter\.com|t\.me)/[^\s<>()\[\]{}]+",
+        flags=re.I,
+    )
+
+    return [normalize_url(match.group(0)) for match in pattern.finditer(line)]
+
+
 def is_x_link(url: str) -> bool:
-    return bool(re.match(r"https://(?:x\.com|twitter\.com)/[A-Za-z0-9_]+(?:/.*)?$", url, re.I))
+    """Check whether a URL is an X or Twitter profile link."""
+
+    return bool(
+        re.match(
+            r"https://(?:x\.com|twitter\.com)/"
+            r"[A-Za-z0-9_]+(?:/.*)?$",
+            normalize_url(url),
+            flags=re.I,
+        )
+    )
 
 
 def is_telegram_link(url: str) -> bool:
-    return bool(re.match(r"https://t\.me/", url, re.I))
+    """Check whether a URL is a Telegram link."""
+
+    return bool(
+        re.match(
+            r"https://t\.me/",
+            normalize_url(url),
+            flags=re.I,
+        )
+    )
 
 
 def extract_x_username(url: str) -> Optional[str]:
-    match = re.match(r"https://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)", url, re.I)
+    """Extract the username from an X or Twitter URL."""
+
+    match = re.match(
+        r"https://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)",
+        normalize_url(url),
+        flags=re.I,
+    )
+
     return match.group(1) if match else None
 
 
 def extract_public_tg_username(url: str) -> Optional[str]:
-    match = re.match(r"https://t\.me/([A-Za-z0-9_]+)", url, re.I)
+    """Extract a public Telegram username from a t.me URL."""
+
+    match = re.match(
+        r"https://t\.me/([A-Za-z0-9_]+)",
+        normalize_url(url),
+        flags=re.I,
+    )
+
     if not match:
         return None
 
     username = match.group(1)
-    if username.lower() in {"joinchat", "share", "addstickers", "proxy", "socks", "c", "iv"}:
+
+    if username.lower() in {
+        "joinchat",
+        "share",
+        "addstickers",
+        "proxy",
+        "socks",
+        "c",
+        "iv",
+    }:
         return None
+
     return username
 
 
 def is_private_invite_link(url: str) -> bool:
-    return bool(re.match(r"https://t\.me/(?:\+|joinchat/)", url, re.I))
+    """Identify private Telegram invitation links."""
+
+    return bool(
+        re.match(
+            r"https://t\.me/(?:\+|joinchat/)",
+            normalize_url(url),
+            flags=re.I,
+        )
+    )
 
 
 def derive_project_name(x_link: str) -> str:
+    """Create a readable fallback project name from the X username."""
+
     username = extract_x_username(x_link)
+
     if not username:
         return "Unknown Project"
 
@@ -112,47 +187,93 @@ def derive_project_name(x_link: str) -> str:
         "curvefinance": "Curve Finance",
         "1inch": "1inch",
     }
+
     if username.lower() in known_names:
         return known_names[username.lower()]
 
     cleaned = username.replace("_", " ").strip()
-    return " ".join(word.upper() if len(word) <= 3 else word.capitalize() for word in cleaned.split())
+
+    return " ".join(
+        word.upper() if len(word) <= 3 else word.capitalize()
+        for word in cleaned.split()
+    )
+
+
+def clean_project_name(line: str) -> str:
+    """Remove list numbering and labels from a supplied project name."""
+
+    value = line.strip()
+    value = re.sub(r"^\s*\d+\s*[.)-]\s*", "", value)
+    value = re.sub(r"^Project\s*:\s*", "", value, flags=re.I)
+    return value.strip()
 
 
 def pair_project_links(text: str) -> list[dict]:
-    """Accept either Name + X + TG, or simply X + TG."""
+    """
+    Parse all of these formats:
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    Tagger AI
+    https://x.com/taggerai
+    https://t.me/Tagger_DATA
+
+    1. Tagger AI
+    X: https://twitter.com/taggerai
+    TG: https://t.me/Tagger_DATA
+
+    https://x.com/taggerai
+    https://t.me/Tagger_DATA
+    """
+
     projects: list[dict] = []
     current: Optional[dict] = None
     pending_name: Optional[str] = None
 
-    for line in lines:
-        normalized = normalize_url(line) if line.lower().startswith(("http://", "https://")) else line
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
 
-        if is_x_link(normalized):
-            if current is not None:
-                projects.append(current)
+        if not line:
+            continue
 
-            current = {
-                "project_name": pending_name.strip() if pending_name else derive_project_name(normalized),
-                "x_link": normalized,
-                "tg_link": None,
-            }
-            pending_name = None
+        links = extract_links_from_line(line)
 
-        elif is_telegram_link(normalized):
-            if current is not None and current["tg_link"] is None:
-                current["tg_link"] = normalized
+        if links:
+            for link in links:
+                if is_x_link(link):
+                    if current is not None:
+                        projects.append(current)
 
-        elif not normalized.startswith(("http://", "https://")):
-            pending_name = normalized
+                    current = {
+                        "project_name": (
+                            pending_name
+                            if pending_name
+                            else derive_project_name(link)
+                        ),
+                        "x_link": link,
+                        "tg_link": None,
+                    }
+                    pending_name = None
+
+                elif is_telegram_link(link):
+                    if current is not None and current["tg_link"] is None:
+                        current["tg_link"] = link
+
+            continue
+
+        candidate_name = clean_project_name(line)
+
+        if candidate_name and not candidate_name.lower() in {
+            "owner",
+            "admins",
+            "admin",
+            "top active admins",
+            "status",
+        }:
+            pending_name = candidate_name
 
     if current is not None:
         projects.append(current)
 
     return projects
-
 
 def mark_duplicates(projects: list[dict]) -> list[dict]:
     seen_x: set[str] = set()
@@ -554,15 +675,36 @@ async def help_handler(event):
 
 @bot_client.on(events.NewMessage)
 async def project_list_handler(event):
+    """Receive and parse project lists in several common formats."""
+
     text = event.raw_text.strip() if event.raw_text else ""
+
     if not text or text.startswith("/"):
         return
 
-    if not re.search(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/", text, re.I):
-        await event.reply("❌ I could not find an X project link.", link_preview=False)
+    projects = pair_project_links(text)
+
+    if not projects:
+        await event.reply(
+            "❌ I could not detect an X/Twitter project link.\n\n"
+            "Accepted examples:\n"
+            "https://x.com/taggerai\n"
+            "https://twitter.com/taggerai\n"
+            "x.com/taggerai\n"
+            "X: https://x.com/taggerai",
+            link_preview=False,
+        )
         return
 
     await process_project_list(event, text)
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/version(?:@\w+)?$"))
+async def version_handler(event):
+    await event.reply(
+        "Admin Retriever v3.1 — flexible project-name and link parser",
+        link_preview=False,
+    )
 
 
 async def user_client_keepalive() -> None:
